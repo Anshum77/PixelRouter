@@ -1,4 +1,4 @@
-# PixelRouter — Routing Logic
+# PixelRouter - Routing Logic
 # This module contains the CPU-aware routing algorithm.
 # Called by load-balancer/app.py to decide which processor gets a job.
 #
@@ -6,29 +6,94 @@
 #   1. Read metrics for all processors from Redis
 #   2. Sort by pending_jobs (ascending)
 #   3. Use CPU% as tiebreaker
-#   4. If all processors above MAX_CPU_THRESHOLD → trigger autoscale
+#   4. If all processors are above MAX_CPU_THRESHOLD, request autoscale
 #
 # Race condition protection:
 #   - threading.Lock() on the pending job counter
-#   - SET NX EX on job claim (distributed lock)
-#
-# TODO : Implement select_processor()
-# TODO : Implement update_pending_count()
-# TODO : Implement trigger_autoscale()
+#   - Redis INCRBY for atomic counter updates
 
+import os
 import threading
+from urllib.parse import urlparse
+
+METRICS_TTL_SECONDS = 10
+AUTOSCALE_REQUEST_TTL_SECONDS = 60
+MAX_CPU_THRESHOLD = float(os.getenv("MAX_CPU_THRESHOLD", "80"))
 
 _lock = threading.Lock()
+
+
+def processor_id_from_url(processor_url: str) -> str:
+    """
+    Extract the Redis metrics processor id from a processor URL.
+    Example: http://processor-1:8002 -> processor-1
+    """
+    parsed = urlparse(processor_url)
+    return parsed.hostname or processor_url
+
+
+def _parse_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 
 def select_processor(processor_urls: list, redis_client) -> str:
     """
     Returns the URL of the best processor to handle the next job.
-    Placeholder — implement on Upcoming Days.
+    Routing order:
+      1. Skip processors without live CPU metrics
+      2. Pick the processor with the fewest pending jobs
+      3. Use lower CPU usage as the tiebreaker
     """
-    # TODO: Read metrics:processor-N:cpu and metrics:processor-N:pending
-    # TODO: Sort by pending_jobs, CPU% as tiebreaker
-    # TODO: Return URL of winner
-    raise NotImplementedError("Implement on Upcoming Days.")
+    candidates = []
+
+    for processor_url in processor_urls:
+        processor_id = processor_id_from_url(processor_url)
+        cpu_percent = _parse_float(
+            redis_client.get(f"metrics:{processor_id}:cpu")
+        )
+
+        if cpu_percent is None:
+            continue
+
+        pending_jobs = _parse_int(
+            redis_client.get(f"metrics:{processor_id}:pending")
+        )
+
+        candidates.append({
+            "url": processor_url,
+            "processor_id": processor_id,
+            "pending_jobs": max(0, pending_jobs),
+            "cpu_percent": cpu_percent,
+        })
+
+    if not candidates:
+        raise ValueError("No live processors available for routing")
+
+    if all(
+        candidate["cpu_percent"] >= MAX_CPU_THRESHOLD
+        for candidate in candidates
+    ):
+        trigger_autoscale(redis_client)
+
+    selected = min(
+        candidates,
+        key=lambda candidate: (
+            candidate["pending_jobs"],
+            candidate["cpu_percent"],
+            candidate["processor_id"],
+        )
+    )
+    return selected["url"]
 
 
 def update_pending_count(processor_id: str, delta: int, redis_client):
@@ -37,14 +102,30 @@ def update_pending_count(processor_id: str, delta: int, redis_client):
     delta = +1 when job assigned, -1 when job completes.
     """
     with _lock:
-        # TODO: INCRBY metrics:processor-id:pending delta
-        raise NotImplementedError("Implement on Upcoming Days.")
+        pending_key = f"metrics:{processor_id}:pending"
+        new_count = redis_client.incrby(pending_key, delta)
+
+        if new_count < 0:
+            new_count = 0
+            redis_client.set(
+                pending_key,
+                new_count,
+                ex=METRICS_TTL_SECONDS
+            )
+        else:
+            redis_client.expire(pending_key, METRICS_TTL_SECONDS)
+
+        return new_count
 
 
 def trigger_autoscale(redis_client):
     """
-    Spawn a new processor container via Docker SDK
-    when all processors exceed MAX_CPU_THRESHOLD.
-    TODO: Implement on Upcoming Days using docker.from_env()
+    Mark that autoscaling should be requested.
+    Actual Docker SDK / Cloud Run scaling remains a future deployment step.
     """
-    raise NotImplementedError("Implement on Upcoming Days")
+    return redis_client.set(
+        "autoscale:requested",
+        "1",
+        ex=AUTOSCALE_REQUEST_TTL_SECONDS,
+        nx=True
+    )
