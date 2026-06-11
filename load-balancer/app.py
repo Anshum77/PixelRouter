@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 import httpx
 import redis
 
+from autoscaler import scale_local_processors
 from config import get_settings
 from registry import (
     bootstrap_processor_registry,
@@ -28,7 +29,6 @@ app = FastAPI(
 )
 
 settings = get_settings()
-AUTOSCALE_REQUEST_TTL_SECONDS = 60
 
 r = redis.from_url(settings.redis_url, decode_responses=True)
 
@@ -152,25 +152,15 @@ def get_local_capacity_state(live_processors: list[dict]) -> str:
     return "healthy"
 
 
-def request_local_autoscale(redis_client):
-    """
-    Record an autoscale request; the Docker SDK manager will consume this later.
-    """
-    return redis_client.set(
-        "autoscale:requested",
-        "1",
-        ex=AUTOSCALE_REQUEST_TTL_SECONDS,
-        nx=True
-    )
-
-
 def decide_scaling_action(live_processors: list[dict], redis_client) -> str:
     if get_local_capacity_state(live_processors) != "overloaded":
         return "none"
 
     if settings.local_autoscale_enabled:
-        request_local_autoscale(redis_client)
-        return "local_autoscale_requested"
+        result = scale_local_processors(redis_client, settings)
+        if result.scaled:
+            return f"local_scaled:{result.processor_id}"
+        return result.reason
 
     if settings.cloud_fallback_enabled:
         return "cloud_fallback_available"

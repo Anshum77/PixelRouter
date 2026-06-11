@@ -12,7 +12,7 @@ and expose system health through a Streamlit dashboard.
 | Service | Port | Tech |
 |---------|------|------|
 | Upload Service | 8000 | FastAPI, Redis, GCS |
-| Load Balancer | 8001 | FastAPI, Redis, httpx, Docker SDK planned |
+| Load Balancer | 8001 | FastAPI, Redis, httpx, Docker SDK |
 | Processor (x2 local) | 8002, 8003 | FastAPI, rembg, BLIP, psutil |
 | Processor (GCP) | Cloud Run | Same image, cloud deployment planned |
 | Dashboard | 8501 | Streamlit, Plotly |
@@ -57,9 +57,10 @@ Then open `http://localhost:8501`.
   increase only after a processor actually accepts or claims the job.
 - Uses a thread-safe `update_pending_count()` helper with Redis `INCRBY`, clamps
   negative counts to `0`, and refreshes the metrics TTL.
-- If all live processors exceed `MAX_CPU_THRESHOLD`, sets an
-  `autoscale:requested` Redis flag. Actual Docker SDK / Cloud Run scaling is
-  still planned.
+- If all live local processors exceed `MAX_CPU_THRESHOLD`, the Docker
+  autoscaler attempts to spawn one additional local processor.
+- Local autoscaling registers each new processor in Redis and stops at
+  `MAX_PROCESSORS`.
 
 ## Load Balancer Config
 
@@ -98,7 +99,8 @@ Under active development.
 - [x] Load balancer CPU-aware router selection
 - [x] Redis-backed processor registry
 - [x] Thread-safe pending count helper
-- [x] Autoscale request signal
+- [x] Docker SDK local autoscaling manager
+- [x] MAX_PROCESSORS local scale limit
 - [ ] Processor job claim flow increments/decrements pending counts
 - [ ] Upload service file handling and GCS storage
 - [ ] Processor rembg + BLIP pipeline

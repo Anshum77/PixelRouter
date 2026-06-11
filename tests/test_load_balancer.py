@@ -11,6 +11,7 @@ from app import (
     get_local_capacity_state,
     has_healthy_local_capacity,
 )
+from autoscaler import scale_local_processors
 from registry import (
     bootstrap_processor_registry,
     get_processor_urls,
@@ -74,6 +75,31 @@ PROCESSORS = [
     "http://processor-1:8002",
     "http://processor-2:8003",
 ]
+
+
+class FakeSettings:
+    redis_url = "redis://redis:6379"
+    max_processors = 5
+    processor_base_port = 8002
+    processor_image = "pixelrouter-processor:latest"
+    processor_network = "pixelrouter_pixelrouter-network"
+
+
+class FakeContainers:
+    def __init__(self):
+        self.run_calls = []
+
+    def run(self, *args, **kwargs):
+        self.run_calls.append({
+            "args": args,
+            "kwargs": kwargs,
+        })
+        return object()
+
+
+class FakeDockerClient:
+    def __init__(self):
+        self.containers = FakeContainers()
 
 
 def test_processor_id_from_url_returns_hostname():
@@ -234,6 +260,71 @@ def test_no_live_processors_are_not_treated_as_overloaded():
     assert has_healthy_local_capacity([]) is False
     assert get_local_capacity_state([]) == "no_live_local_processors"
     assert decide_scaling_action([], redis_client) == "none"
+
+
+def test_scale_local_processors_spawns_next_processor_and_registers_it():
+    redis_client = FakeRedis()
+    docker_client = FakeDockerClient()
+    bootstrap_processor_registry(redis_client, PROCESSORS)
+
+    result = scale_local_processors(
+        redis_client,
+        FakeSettings,
+        docker_client=docker_client,
+    )
+
+    run_call = docker_client.containers.run_calls[0]
+
+    assert result.scaled is True
+    assert result.processor_id == "processor-3"
+    assert result.processor_url == "http://processor-3:8004"
+    assert result.local_count == 3
+    assert run_call["args"] == ("pixelrouter-processor:latest",)
+    assert run_call["kwargs"]["name"] == "processor-3"
+    assert run_call["kwargs"]["network"] == "pixelrouter_pixelrouter-network"
+    assert run_call["kwargs"]["ports"] == {"8004/tcp": 8004}
+    assert run_call["kwargs"]["environment"]["PROCESSOR_ID"] == "processor-3"
+    assert run_call["kwargs"]["environment"]["PORT"] == "8004"
+    assert get_processor_urls(redis_client, processor_type="local") == [
+        "http://processor-1:8002",
+        "http://processor-2:8003",
+        "http://processor-3:8004",
+    ]
+
+
+def test_scale_local_processors_enforces_max_processor_limit():
+    redis_client = FakeRedis()
+    docker_client = FakeDockerClient()
+    bootstrap_processor_registry(redis_client, PROCESSORS)
+    register_processor(
+        redis_client,
+        processor_id="processor-3",
+        url="http://processor-3:8004",
+        processor_type="local",
+    )
+    register_processor(
+        redis_client,
+        processor_id="processor-4",
+        url="http://processor-4:8005",
+        processor_type="local",
+    )
+    register_processor(
+        redis_client,
+        processor_id="processor-5",
+        url="http://processor-5:8006",
+        processor_type="local",
+    )
+
+    result = scale_local_processors(
+        redis_client,
+        FakeSettings,
+        docker_client=docker_client,
+    )
+
+    assert result.scaled is False
+    assert result.reason == "max_processors_reached"
+    assert result.local_count == 5
+    assert docker_client.containers.run_calls == []
 
 
 def test_update_pending_count_increments_and_clamps_to_zero():
