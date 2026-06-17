@@ -4,15 +4,16 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only PyTorch FIRST — much smaller (~150MB vs 2.5GB GPU version)
+# 1. Install CPU-only PyTorch (Small ~150MB, much faster/stable)
 RUN pip install --no-cache-dir --default-timeout=1000 \
     torch==2.3.0 torchvision \
     --index-url https://download.pytorch.org/whl/cpu
 
+# 2. Install the rest of requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir --default-timeout=1000 -r requirements.txt
 
-# Pre-download rembg's U2Net model (~170MB) at build time.
+# 3. Pre-download rembg model
 RUN python -c "\
 import rembg; \
 from PIL import Image; \
@@ -25,4 +26,5 @@ print('rembg model pre-downloaded successfully')"
 
 COPY . .
 EXPOSE 8002
+# Removed --reload for production
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8002"]
