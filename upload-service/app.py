@@ -13,6 +13,10 @@ import redis
 import os
 import uuid
 import time
+import logging
+
+
+logger = logging.getLogger("upload-service")
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,54 @@ class UploadServiceSettings:
 settings = UploadServiceSettings.from_env()
 r = redis.from_url(settings.redis_url, decode_responses=True)
 gcs_client = None
+
+
+def _get_file_extension(filename: str) -> str:
+    """Extract lowercase extension from filename; default to 'jpg' if missing."""
+    if not filename or "." not in filename:
+        return "jpg"
+    return filename.rsplit(".", 1)[-1].lower()
+
+
+async def _upload_to_gcs(
+    file_bytes: bytes,
+    job_id: str,
+    filename: str,
+    content_type: str
+) -> dict:
+    """
+    Upload file bytes to GCS and return metadata.
+    Returns dict with object_name, bucket_name, and gcs_path.
+    """
+    if gcs_client is None:
+        raise RuntimeError("GCS client not initialized")
+    
+    extension = _get_file_extension(filename)
+    object_name = f"{settings.gcs_object_prefix}/{job_id}.{extension}"
+    
+    bucket = gcs_client.bucket(settings.gcs_bucket_name)
+    blob = bucket.blob(object_name)
+    
+    try:
+        blob.upload_from_string(
+            file_bytes,
+            content_type=content_type
+        )
+        logger.info(
+            f"[{job_id}] Uploaded to GCS: {object_name} ({len(file_bytes)} bytes)"
+        )
+    except Exception as e:
+        logger.error(f"[{job_id}] GCS upload failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"GCS upload failed: {str(e)}"
+        )
+    
+    return {
+        "object_name": object_name,
+        "bucket_name": settings.gcs_bucket_name,
+        "gcs_path": f"gs://{settings.gcs_bucket_name}/{object_name}",
+    }
 
 
 @asynccontextmanager
@@ -99,11 +151,8 @@ async def health():
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
     """
-    Accept an image upload and create a job.
+    Accept an image upload, store in GCS, create a job, and enqueue.
     Returns job_id for tracking.
-    TODO: Store image in GCS
-    TODO: Ask load balancer which processor to route to
-    TODO: Push job_id to Redis queue
     """
     # Validate file type
     if file.content_type not in ["image/jpeg", "image/png", "image/webp"]:
@@ -111,13 +160,33 @@ async def upload_image(file: UploadFile = File(...)):
 
     # Generate unique job ID
     job_id = f"job_{uuid.uuid4().hex[:8]}"
+    
+    # Read file bytes
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+    except Exception as e:
+        logger.error(f"[{job_id}] File read failed: {e}")
+        raise HTTPException(status_code=400, detail="Failed to read file")
 
-    # Create job record in Redis
+    # Upload to GCS
+    gcs_metadata = await _upload_to_gcs(
+        file_bytes,
+        job_id,
+        file.filename or "upload.jpg",
+        file.content_type
+    )
+
+    # Create job record in Redis with GCS metadata
     r.hset(f"job:{job_id}", mapping={
         "status": "pending",
         "filename": file.filename,
         "created_at": str(int(time.time())),
-        "processor": "",
+        "gcs_object": gcs_metadata["object_name"],
+        "gcs_path": gcs_metadata["gcs_path"],
+        "processor_id": "",
+        "processor_url": "",
         "result_url": ""
     })
 
@@ -126,11 +195,13 @@ async def upload_image(file: UploadFile = File(...)):
 
     # Push to processing queue
     r.lpush("image_queue", job_id)
+    logger.info(f"[{job_id}] Queued for processing")
 
     return {
         "job_id": job_id,
         "status": "pending",
-        "message": "Job created successfully"
+        "gcs_path": gcs_metadata["gcs_path"],
+        "message": "Job created and queued for processing"
     }
 
 
