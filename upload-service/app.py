@@ -97,6 +97,55 @@ async def _upload_to_gcs(
     }
 
 
+async def _get_route_decision(job_id: str) -> dict:
+    """Fetch the current routing decision from the load balancer."""
+    route_url = f"{settings.load_balancer_url.rstrip('/')}/route"
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+            response = await client.get(route_url)
+            response.raise_for_status()
+            route_data = response.json()
+    except httpx.HTTPStatusError as exc:
+        logger.error(f"[{job_id}] Load balancer returned {exc.response.status_code}")
+        raise HTTPException(
+            status_code=502,
+            detail="Load balancer route request failed"
+        ) from exc
+    except httpx.RequestError as exc:
+        logger.error(f"[{job_id}] Load balancer request failed: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="Load balancer is unavailable"
+        ) from exc
+    except ValueError as exc:
+        logger.error(f"[{job_id}] Invalid route response: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid load balancer response"
+        ) from exc
+
+    processor_url = route_data.get("processor_url")
+    processor_id = route_data.get("processor_id")
+    tier = route_data.get("tier")
+
+    if not processor_url or not processor_id or not tier:
+        raise HTTPException(
+            status_code=502,
+            detail="Incomplete routing metadata from load balancer"
+        )
+
+    return {
+        "processor_url": processor_url,
+        "processor_id": processor_id,
+        "tier": tier,
+        "fallback_used": bool(route_data.get("fallback_used", False)),
+        "scaled": bool(route_data.get("scaled", False)),
+        "scaling_action": route_data.get("scaling_action", ""),
+        "reason": route_data.get("reason", ""),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize GCS client and Redis connection at startup."""
@@ -178,15 +227,22 @@ async def upload_image(file: UploadFile = File(...)):
         file.content_type
     )
 
-    # Create job record in Redis with GCS metadata
+    route_decision = await _get_route_decision(job_id)
+
+    # Create job record in Redis with GCS and routing metadata
     r.hset(f"job:{job_id}", mapping={
         "status": "pending",
         "filename": file.filename,
         "created_at": str(int(time.time())),
         "gcs_object": gcs_metadata["object_name"],
         "gcs_path": gcs_metadata["gcs_path"],
-        "processor_id": "",
-        "processor_url": "",
+        "processor_id": route_decision["processor_id"],
+        "processor_url": route_decision["processor_url"],
+        "processor_tier": route_decision["tier"],
+        "fallback_used": str(route_decision["fallback_used"]).lower(),
+        "scaled": str(route_decision["scaled"]).lower(),
+        "scaling_action": route_decision["scaling_action"],
+        "route_reason": route_decision["reason"],
         "result_url": ""
     })
 
@@ -201,6 +257,10 @@ async def upload_image(file: UploadFile = File(...)):
         "job_id": job_id,
         "status": "pending",
         "gcs_path": gcs_metadata["gcs_path"],
+        "processor_id": route_decision["processor_id"],
+        "processor_url": route_decision["processor_url"],
+        "tier": route_decision["tier"],
+        "fallback_used": route_decision["fallback_used"],
         "message": "Job created and queued for processing"
     }
 
